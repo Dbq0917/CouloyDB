@@ -133,11 +133,6 @@ func (db *DB) put(key, value []byte, duration time.Duration) error {
 	var expiration int64
 	if duration != 0 {
 		expiration = time.Now().Add(duration).UnixNano()
-		db.ttl.add(ds.NewJob(string(key), time.Unix(0, expiration)))
-	} else {
-		// If it is a key without an expiration time set
-		// you may need to remove the previously set expiration time
-		db.ttl.del(string(key))
 	}
 
 	logRecord := &data.LogRecord{
@@ -151,6 +146,12 @@ func (db *DB) put(key, value []byte, duration time.Duration) error {
 	pos, err := db.appendLogRecordWithLock(logRecord)
 	if err != nil {
 		return err
+	}
+
+	if duration != 0 {
+		db.ttl.add(ds.NewJob(string(key), time.Unix(0, expiration)))
+	} else {
+		db.ttl.del(string(key))
 	}
 
 	db.Notify(string(key), value, PutEvent)
