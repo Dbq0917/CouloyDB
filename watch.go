@@ -84,11 +84,18 @@ func (wm *watcherManager) unWatch(watcher *Watcher) {
 }
 
 func (wm *watcherManager) watched(key string) bool {
+	wm.lock.RLock()
+	defer wm.lock.RUnlock()
 	_, ok := wm.watchers[key]
 	return ok
 }
 
 func (wm *watcherManager) notify(watchEvent *watchEvent) {
+	wm.lock.RLock()
+	defer wm.lock.RUnlock()
+	if _, ok := wm.watchers[watchEvent.key]; !ok {
+		return
+	}
 	wm.queue.Write(watchEvent)
 }
 
@@ -102,12 +109,11 @@ func (wm *watcherManager) start() {
 
 		wm.lock.RLock()
 		for watcher := range wm.watchers[event.key] {
-			watcher := watcher
 			if watcher.canceled {
 				continue
 			}
 
-			go watcher.sendResp(event)
+			watcher.sendResp(event)
 		}
 		wm.lock.RUnlock()
 	}

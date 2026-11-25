@@ -127,37 +127,45 @@ func (db *DB) put(key, value []byte, duration time.Duration) error {
 		return err
 	}
 
-	db.getIndexLockByType(data.String).Lock()
-	defer db.getIndexLockByType(data.String).Unlock()
+	indexLock := db.getIndexLockByType(data.String)
+	event, err := func() (*watchEvent, error) {
+		indexLock.Lock()
+		defer indexLock.Unlock()
 
-	var expiration int64
-	if duration != 0 {
-		expiration = time.Now().Add(duration).UnixNano()
-		db.ttl.add(ds.NewJob(string(key), time.Unix(0, expiration)))
-	} else {
-		// If it is a key without an expiration time set
-		// you may need to remove the previously set expiration time
-		db.ttl.del(string(key))
-	}
+		var expiration int64
+		if duration != 0 {
+			expiration = time.Now().Add(duration).UnixNano()
+			db.ttl.add(ds.NewJob(string(key), time.Unix(0, expiration)))
+		} else {
+			// If it is a key without an expiration time set
+			// you may need to remove the previously set expiration time
+			db.ttl.del(string(key))
+		}
 
-	logRecord := &data.LogRecord{
-		Key:        encodeKeyWithTxId(key, public.NO_TX_ID),
-		Value:      value,
-		Type:       data.LogRecordNormal,
-		DataType:   data.String,
-		Expiration: expiration,
-	}
+		logRecord := &data.LogRecord{
+			Key:        encodeKeyWithTxId(key, public.NO_TX_ID),
+			Value:      value,
+			Type:       data.LogRecordNormal,
+			DataType:   data.String,
+			Expiration: expiration,
+		}
 
-	pos, err := db.appendLogRecordWithLock(logRecord)
+		pos, err := db.appendLogRecordWithLock(logRecord)
+		if err != nil {
+			return nil, err
+		}
+
+		if ok := db.index.getStrIndex().Put(key, pos); !ok {
+			return nil, public.ErrUpdateIndexFailed
+		}
+
+		return &watchEvent{key: string(key), value: value, eventType: PutEvent}, nil
+	}()
 	if err != nil {
 		return err
 	}
 
-	db.Notify(string(key), value, PutEvent)
-
-	if ok := db.index.getStrIndex().Put(key, pos); !ok {
-		return public.ErrUpdateIndexFailed
-	}
+	db.Notify(event.key, event.value, event.eventType)
 	return nil
 }
 
@@ -186,34 +194,45 @@ func (db *DB) Del(key []byte) error {
 	if len(key) == 0 {
 		return public.ErrKeyIsEmpty
 	}
-	// Check if exist in memory memTable
 
-	db.getIndexLockByType(data.String).Lock()
-	defer db.getIndexLockByType(data.String).Unlock()
+	indexLock := db.getIndexLockByType(data.String)
+	event, err := func() (*watchEvent, error) {
+		indexLock.Lock()
+		defer indexLock.Unlock()
 
-	if pos := db.index.getStrIndex().Get(key); pos == nil {
-		return nil
-	}
+		// Check if exist in memory memTable
+		if pos := db.index.getStrIndex().Get(key); pos == nil {
+			return nil, nil
+		}
 
-	db.ttl.del(string(key))
+		db.ttl.del(string(key))
 
-	// Build deleted tags LogRecord
-	logRecord := &data.LogRecord{
-		Key:  encodeKeyWithTxId(key, public.NO_TX_ID),
-		Type: data.LogRecordDeleted,
-	}
+		// Build deleted tags LogRecord
+		logRecord := &data.LogRecord{
+			Key:  encodeKeyWithTxId(key, public.NO_TX_ID),
+			Type: data.LogRecordDeleted,
+		}
 
-	_, err := db.appendLogRecordWithLock(logRecord)
+		_, err := db.appendLogRecordWithLock(logRecord)
+		if err != nil {
+			return nil, err
+		}
+
+		// Delete key in memory memTable
+		if ok := db.index.getStrIndex().Del(key); !ok {
+			return nil, public.ErrUpdateIndexFailed
+		}
+
+		return &watchEvent{key: string(key), eventType: DelEvent}, nil
+	}()
 	if err != nil {
 		return err
 	}
-
-	db.Notify(string(key), nil, DelEvent)
-
-	// Delete key in memory memTable
-	if ok := db.index.getStrIndex().Del(key); !ok {
-		return public.ErrUpdateIndexFailed
+	if event == nil {
+		return nil
 	}
+
+	db.Notify(event.key, event.value, event.eventType)
 	return nil
 }
 
@@ -722,13 +741,13 @@ func (db *DB) Watch(ctx context.Context, key string) <-chan *watchEvent {
 }
 
 func (db *DB) UnWatch(watcher *Watcher) {
+	db.wm.lock.Lock()
+	defer db.wm.lock.Unlock()
 	db.wm.unWatch(watcher)
 }
 
 func (db *DB) Notify(key string, value []byte, entryType eventType) {
-	if db.wm.watched(key) {
-		db.wm.notify(&watchEvent{key: key, value: value, eventType: entryType})
-	}
+	db.wm.notify(&watchEvent{key: key, value: value, eventType: entryType})
 }
 
 func (db *DB) getIndexLockByType(typ data.DataType) *sync.RWMutex {
